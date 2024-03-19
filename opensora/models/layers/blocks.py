@@ -142,7 +142,6 @@ class Attention(nn.Module):
         if rope is not None:
             self.rope = True
             self.rotary_emb = rope
-            print("Using rotary position encoding")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
