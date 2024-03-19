@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from einops import rearrange
+from rotary_embedding_torch import RotaryEmbedding
 from timm.models.layers import DropPath
 from timm.models.vision_transformer import Mlp
 
@@ -16,6 +17,7 @@ from opensora.models.layers.blocks import (
     PatchEmbed3D,
     SeqParallelAttention,
     SeqParallelMultiHeadCrossAttention,
+    SizeEmbedder,
     T2IFinalLayer,
     TimestepEmbedder,
     approx_gelu,
@@ -40,6 +42,7 @@ class STDiT2Block(nn.Module):
         enable_flashattn=False,
         enable_layernorm_kernel=False,
         enable_sequence_parallelism=False,
+        rope=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -83,29 +86,34 @@ class STDiT2Block(nn.Module):
             num_heads=num_heads,
             qkv_bias=True,
             enable_flashattn=self.enable_flashattn,
+            rope=rope,
         )
+        self.scale_shift_table_temporal = nn.Parameter(torch.randn(3, hidden_size) / hidden_size**0.5)
+        self.norm_temp = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=enable_layernorm_kernel)
 
-    def forward(self, x, y, t, mask=None, tpe=None):
+    def forward(self, x, y, t, t_tmp, mask=None):
         B, N, C = x.shape
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + t.reshape(B, 6, -1)
         ).chunk(6, dim=1)
-        x_m = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
+        shift_tmp, scale_tmp, gate_tmp = (self.scale_shift_table_temporal[None] + t_tmp.reshape(B, 3, -1)).chunk(
+            3, dim=1
+        )
 
         # spatial branch
-        x_s = rearrange(x_m, "B (T S) C -> (B T) S C", T=self.d_t, S=self.d_s)
+        x_s = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
+        x_s = rearrange(x_s, "B (T S) C -> (B T) S C", T=self.d_t, S=self.d_s)
         x_s = self.attn(x_s)
         x_s = rearrange(x_s, "(B T) S C -> B (T S) C", T=self.d_t, S=self.d_s)
         x = x + self.drop_path(gate_msa * x_s)
 
         # temporal branch
-        x_t = rearrange(x, "B (T S) C -> (B S) T C", T=self.d_t, S=self.d_s)
-        if tpe is not None:
-            x_t = x_t + tpe
+        x_t = t2i_modulate(self.norm_temp(x), shift_tmp, scale_tmp)
+        x_t = rearrange(x_t, "B (T S) C -> (B S) T C", T=self.d_t, S=self.d_s)
         x_t = self.attn_temp(x_t)
         x_t = rearrange(x_t, "(B S) T C -> B (T S) C", T=self.d_t, S=self.d_s)
-        x = x + self.drop_path(gate_msa * x_t)
+        x = x + self.drop_path(gate_tmp * x_t)
 
         # cross attn
         x = x + self.cross_attn(x, y, mask)
@@ -163,11 +171,12 @@ class STDiT2(nn.Module):
         self.time_scale = time_scale
 
         self.register_buffer("pos_embed", self.get_spatial_pos_embed())
-        self.register_buffer("pos_embed_temporal", self.get_temporal_pos_embed())
+        # self.register_buffer("pos_embed_temporal", self.get_temporal_pos_embed())
 
         self.x_embedder = PatchEmbed3D(patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+        self.t_block_temp = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size, bias=True))
         self.y_embedder = CaptionEmbedder(
             in_channels=caption_channels,
             hidden_size=hidden_size,
@@ -177,6 +186,7 @@ class STDiT2(nn.Module):
         )
 
         drop_path = [x.item() for x in torch.linspace(0, drop_path, depth)]
+        self.rope = RotaryEmbedding(dim=self.hidden_size // self.num_heads)
         self.blocks = nn.ModuleList(
             [
                 STDiT2Block(
@@ -189,11 +199,18 @@ class STDiT2(nn.Module):
                     enable_sequence_parallelism=enable_sequence_parallelism,
                     d_t=self.num_temporal,
                     d_s=self.num_spatial,
+                    rope=self.rope,
                 )
                 for i in range(self.depth)
             ]
         )
         self.final_layer = T2IFinalLayer(hidden_size, np.prod(self.patch_size), self.out_channels)
+
+        # multi_res
+        assert self.hidden_size % 3 == 0, "hidden_size must be divisible by 3"
+        self.csize_embedder = SizeEmbedder(self.hidden_size // 3)
+        self.ar_embedder = SizeEmbedder(self.hidden_size // 3)
+        self.fl_embedder = SizeEmbedder(self.hidden_size)
 
         # init model
         self.initialize_weights()
@@ -224,10 +241,18 @@ class STDiT2(nn.Module):
         Returns:
             x (torch.Tensor): output latent representation; of shape [B, C, T, H, W]
         """
-
+        B = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
         y = y.to(self.dtype)
+
+        hw = torch.tensor([self.input_size[1], self.input_size[2]], device=x.device, dtype=x.dtype).repeat(B, 1)
+        ar = torch.tensor([[self.input_size[1] / self.input_size[2]]], device=x.device, dtype=x.dtype).repeat(B, 1)
+        fl = torch.tensor([self.input_size[0]], device=x.device, dtype=x.dtype).repeat(B, 1)
+        csize = self.csize_embedder(hw, B)
+        ar = self.ar_embedder(ar, B)
+        fl = self.fl_embedder(fl, B)
+        data_info = torch.cat([csize, ar], dim=1)
 
         # embedding
         x = self.x_embedder(x)  # [B, N, C]
@@ -240,7 +265,8 @@ class STDiT2(nn.Module):
             x = split_forward_gather_backward(x, get_sequence_parallel_group(), dim=1, grad_scale="down")
 
         t = self.t_embedder(timestep, dtype=x.dtype)  # [B, C]
-        t0 = self.t_block(t)  # [B, C]
+        t0 = self.t_block(t + data_info)  # [B, C]
+        t1 = self.t_block_temp(t + fl)  # [B, C]
         y = self.y_embedder(y, self.training)  # [B, 1, N_token, C]
 
         if mask is not None:
@@ -255,16 +281,7 @@ class STDiT2(nn.Module):
 
         # blocks
         for i, block in enumerate(self.blocks):
-            if i == 0:
-                if self.enable_sequence_parallelism:
-                    tpe = torch.chunk(
-                        self.pos_embed_temporal, dist.get_world_size(get_sequence_parallel_group()), dim=1
-                    )[self.sp_rank].contiguous()
-                else:
-                    tpe = self.pos_embed_temporal
-            else:
-                tpe = None
-            x = auto_grad_checkpoint(block, x, y, t0, y_lens, tpe)
+            x = auto_grad_checkpoint(block, x, y, t0, t1, y_lens)
 
         if self.enable_sequence_parallelism:
             x = gather_forward_split_backward(x, get_sequence_parallel_group(), dim=1, grad_scale="up")

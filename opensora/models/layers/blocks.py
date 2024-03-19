@@ -121,6 +121,7 @@ class Attention(nn.Module):
         proj_drop: float = 0.0,
         norm_layer: nn.Module = nn.LayerNorm,
         enable_flashattn: bool = False,
+        rope=None,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -137,16 +138,28 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        self.rope = False
+        if rope is not None:
+            self.rope = True
+            self.rotary_emb = rope
+            print("Using rotary position encoding")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x)
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        if self.enable_flashattn:
-            qkv_permute_shape = (2, 0, 1, 3, 4)
-        else:
-            qkv_permute_shape = (2, 0, 3, 1, 4)
-        qkv = qkv.view(qkv_shape).permute(qkv_permute_shape)
+
+        qkv = qkv.view(qkv_shape).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+        if self.rope:
+            q = self.rotary_emb.rotate_queries_or_keys(q)
+            k = self.rotary_emb.rotate_queries_or_keys(k)
+        if self.enable_flashattn:
+            # (B, #heads, N, #dim) -> (B, N, #heads, #dim)
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+
         q, k = self.q_norm(q), self.k_norm(k)
         if self.enable_flashattn:
             from flash_attn import flash_attn_func
@@ -188,6 +201,7 @@ class SeqParallelAttention(Attention):
         proj_drop: float = 0.0,
         norm_layer: nn.Module = nn.LayerNorm,
         enable_flashattn: bool = False,
+        rope=None,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -328,7 +342,7 @@ class SeqParallelMultiHeadCrossAttention(MultiHeadCrossAttention):
         if mask is not None:
             attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
         x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
-        
+
         # apply all to all to gather back attention heads and scatter sequence
         x = x.view(B, -1, self.num_heads // sp_size, self.head_dim)
         x = all_to_all(x, sp_group, scatter_dim=1, gather_dim=2)
