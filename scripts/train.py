@@ -29,11 +29,48 @@ from opensora.utils.config_utils import (
 )
 from opensora.utils.misc import all_reduce_mean, format_numel_str, get_model_numel, requires_grad, to_torch_dtype
 from opensora.utils.train_utils import update_ema
+import random
 
 
 class MaskGenerator:
+    def __init__(self):
+        self.mask_name = ["mask_no", "mask_random", "mask_head", "mask_tail", "mask_head_tail"]
+        self.mask_prob = [0.5, 0.29, 0.07, 0.07, 0.07]
+        self.mask_acc_prob = [sum(self.mask_prob[: i + 1]) for i in range(len(self.mask_prob))]
+
     def get_mask(self, x):
-        return torch.ones(x.shape[0], x.shape[1], dtype=x.dtype, device=x.device)
+        mask_type = random.random()
+        for i, acc_prob in enumerate(self.mask_acc_prob):
+            if mask_type <= acc_prob:
+                mask_name = self.mask_name[i]
+                break
+
+        mask = torch.ones(x.shape[2])
+        if mask_name == "mask_random":
+            random_size = random.randint(1, 4)
+            random_pos = random.randint(0, x.shape[2] - random_size)
+            mask[random_pos : random_pos + random_size] = 0
+            return mask
+        elif mask_name == "mask_head":
+            random_size = random.randint(1, 4)
+            mask[:random_size] = 0
+        elif mask_name == "mask_tail":
+            random_size = random.randint(1, 4)
+            mask[-random_size:] = 0
+        elif mask_name == "mask_head_tail":
+            random_size = random.randint(1, 4)
+            mask[:random_size] = 0
+            mask[-random_size:] = 0
+
+        return mask
+
+    def get_masks(self, x):
+        masks = []
+        for _ in range(len(x)):
+            mask = self.get_mask(x)
+            masks.append(mask)
+        masks = torch.stack(masks, dim=0)
+        return masks
 
 
 def main():
@@ -173,6 +210,7 @@ def main():
     model.train()
     update_ema(ema, model, decay=0, sharded=False)
     ema.eval()
+    mask_generator = MaskGenerator()
 
     # =======================================================
     # 5. boost model for distributed training with colossalai
@@ -224,6 +262,7 @@ def main():
                     x = vae.encode(x)  # [B, C, T, H/P, W/P]
                     # Prepare text inputs
                     model_args = text_encoder.encode(y)
+                # mask = mask_generator.get_masks(x)
 
                 # Diffusion
                 t = torch.randint(0, scheduler.num_timesteps, (x.shape[0],), device=device)
