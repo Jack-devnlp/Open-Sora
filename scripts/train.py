@@ -31,6 +31,11 @@ from opensora.utils.misc import all_reduce_mean, format_numel_str, get_model_num
 from opensora.utils.train_utils import update_ema
 
 
+class MaskGenerator:
+    def get_mask(self, x):
+        return torch.ones(x.shape[0], x.shape[1], dtype=x.dtype, device=x.device)
+
+
 def main():
     # ======================================================
     # 1. args & cfg
