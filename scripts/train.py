@@ -45,7 +45,7 @@ class MaskGenerator:
                 mask_name = self.mask_name[i]
                 break
 
-        mask = torch.ones(x.shape[2])
+        mask = torch.ones(x.shape[2], dtype=torch.bool, device=x.device)
         if mask_name == "mask_random":
             random_size = random.randint(1, 4)
             random_pos = random.randint(0, x.shape[2] - random_size)
@@ -262,11 +262,11 @@ def main():
                     x = vae.encode(x)  # [B, C, T, H/P, W/P]
                     # Prepare text inputs
                     model_args = text_encoder.encode(y)
-                # mask = mask_generator.get_masks(x)
+                mask = mask_generator.get_masks(x)
 
                 # Diffusion
                 t = torch.randint(0, scheduler.num_timesteps, (x.shape[0],), device=device)
-                loss_dict = scheduler.training_losses(model, x, t, model_args)
+                loss_dict = scheduler.training_losses(model, x, t, model_args, mask=mask)
 
                 # Backward & update
                 loss = loss_dict["loss"].mean()

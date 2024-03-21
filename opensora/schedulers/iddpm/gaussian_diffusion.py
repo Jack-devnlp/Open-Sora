@@ -15,15 +15,24 @@ import math
 
 import numpy as np
 import torch as th
+from einops import rearrange
 
 from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
 
 
-def mean_flat(tensor):
+def mean_flat(tensor, mask=None):
     """
     Take the mean over all non-batch dimensions.
     """
-    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+    if mask is None:
+        return tensor.mean(dim=list(range(1, len(tensor.shape))))
+    else:
+        assert tensor.dim() == 5
+        assert tensor.shape[2] == mask.shape[1]
+        tensor = rearrange(tensor, "b c t h w -> b t (c h w)")
+        denom = mask.sum(dim=1) * tensor.shape[-1]
+        loss = (tensor * mask.unsqueeze(2)).sum(dim=1).sum(dim=1) / denom
+        return loss
 
 
 class ModelMeanType(enum.Enum):
@@ -653,7 +662,7 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
 
-    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None):
+    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None, mask=None):
         """
         Get a term for the variational lower-bound.
         The resulting units are bits (rather than nats, as one might expect).
@@ -662,23 +671,24 @@ class GaussianDiffusion:
                  - 'output': a shape [N] tensor of NLLs or KLs.
                  - 'pred_xstart': the x_0 predictions.
         """
+        assert mask is not None # TODO: delete
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)
         out = self.p_mean_variance(model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs)
         kl = normal_kl(true_mean, true_log_variance_clipped, out["mean"], out["log_variance"])
-        kl = mean_flat(kl) / np.log(2.0)
+        kl = mean_flat(kl, mask=mask) / np.log(2.0)
 
         decoder_nll = -discretized_gaussian_log_likelihood(
             x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
         )
         assert decoder_nll.shape == x_start.shape
-        decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+        decoder_nll = mean_flat(decoder_nll, mask=mask) / np.log(2.0)
 
         # At the first timestep return the decoder NLL,
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, mask=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -695,10 +705,12 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
+        x_t = th.where(mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1), x_t, x_start)
 
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+            assert mask is None, "mask not supported for KL loss"
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
                 x_start=x_start,
@@ -728,6 +740,7 @@ class GaussianDiffusion:
                     x_t=x_t,
                     t=t,
                     clip_denoised=False,
+                    mask=mask,
                 )["output"]
                 if self.loss_type == LossType.RESCALED_MSE:
                     # Divide by 1000 for equivalence with initial implementation.
@@ -740,7 +753,7 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            terms["mse"] = mean_flat((target - model_output) ** 2, mask=mask)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
