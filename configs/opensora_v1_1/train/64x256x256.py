@@ -46,7 +46,8 @@ wandb = False
 
 epochs = 1000
 log_every = 10
-ckpt_every = 250
+# ckpt_every = 250
+ckpt_every = 10
 load = None
 
 batch_size = 16

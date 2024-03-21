@@ -151,8 +151,8 @@ class Attention(nn.Module):
         qkv = qkv.view(qkv_shape).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         if self.rope:
-            q = self.rotary_emb.rotate_queries_or_keys(q)
-            k = self.rotary_emb.rotate_queries_or_keys(k)
+            q = self.rotary_emb(q)
+            k = self.rotary_emb(k)
         if self.enable_flashattn:
             # (B, #heads, N, #dim) -> (B, N, #heads, #dim)
             q = q.permute(0, 2, 1, 3)

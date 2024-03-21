@@ -69,7 +69,7 @@ class STDiT2Block(nn.Module):
             in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size**0.5)
+        self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size**0.5) # new
 
         # temporal attention
         self.d_s = d_s
@@ -88,8 +88,8 @@ class STDiT2Block(nn.Module):
             enable_flashattn=self.enable_flashattn,
             rope=rope,
         )
-        self.scale_shift_table_temporal = nn.Parameter(torch.randn(3, hidden_size) / hidden_size**0.5)
-        self.norm_temp = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=enable_layernorm_kernel)
+        self.scale_shift_table_temporal = nn.Parameter(torch.randn(3, hidden_size) / hidden_size**0.5) # new
+        self.norm_temp = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=enable_layernorm_kernel) # new
 
     def forward(self, x, y, t, t_tmp, mask=None):
         B, N, C = x.shape
@@ -176,7 +176,7 @@ class STDiT2(nn.Module):
         self.x_embedder = PatchEmbed3D(patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
-        self.t_block_temp = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size, bias=True))
+        self.t_block_temp = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size, bias=True)) # new
         self.y_embedder = CaptionEmbedder(
             in_channels=caption_channels,
             hidden_size=hidden_size,
@@ -186,7 +186,7 @@ class STDiT2(nn.Module):
         )
 
         drop_path = [x.item() for x in torch.linspace(0, drop_path, depth)]
-        self.rope = RotaryEmbedding(dim=self.hidden_size // self.num_heads)
+        self.rope = RotaryEmbedding(dim=self.hidden_size // self.num_heads) # new
         self.blocks = nn.ModuleList(
             [
                 STDiT2Block(
@@ -199,7 +199,7 @@ class STDiT2(nn.Module):
                     enable_sequence_parallelism=enable_sequence_parallelism,
                     d_t=self.num_temporal,
                     d_s=self.num_spatial,
-                    rope=self.rope,
+                    rope=self.rope.rotate_queries_or_keys,
                 )
                 for i in range(self.depth)
             ]
@@ -210,7 +210,7 @@ class STDiT2(nn.Module):
         assert self.hidden_size % 3 == 0, "hidden_size must be divisible by 3"
         self.csize_embedder = SizeEmbedder(self.hidden_size // 3)
         self.ar_embedder = SizeEmbedder(self.hidden_size // 3)
-        self.fl_embedder = SizeEmbedder(self.hidden_size)
+        self.fl_embedder = SizeEmbedder(self.hidden_size) # new
 
         # init model
         self.initialize_weights()
@@ -382,6 +382,7 @@ class STDiT2(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.normal_(self.t_block[1].weight, std=0.02)
+        nn.init.normal_(self.t_block_temp[1].weight, std=0.02)
 
         # Initialize caption embedding MLP:
         nn.init.normal_(self.y_embedder.y_proj.fc1.weight, std=0.02)

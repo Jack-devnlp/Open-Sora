@@ -143,14 +143,15 @@ def save(
     batch_size: int,
     coordinator: DistCoordinator,
     save_dir: str,
-    shape_dict: dict,
+    shape_dict: dict = None,
 ):
     save_dir = os.path.join(save_dir, f"epoch{epoch}-global_step{global_step}")
     os.makedirs(os.path.join(save_dir, "model"), exist_ok=True)
 
     booster.save_model(model, os.path.join(save_dir, "model"), shard=True)
     # ema is not boosted, so we don't need to use booster.save_model
-    model_gathering(ema, shape_dict)
+    if shape_dict is not None:
+        model_gathering(ema, shape_dict)
     global_rank = dist.get_rank()
     if int(global_rank) == 0:
         torch.save(ema.state_dict(), os.path.join(save_dir, "ema.pt"))
@@ -176,7 +177,9 @@ def load(
     booster.load_model(model, os.path.join(load_dir, "model"))
     # ema is not boosted, so we don't use booster.load_model
     # ema.load_state_dict(torch.load(os.path.join(load_dir, "ema.pt")))
-    ema.load_state_dict(torch.load(os.path.join(load_dir, "ema.pt"), map_location=torch.device("cpu")))
+    missing_keys, unexpected_keys = ema.load_state_dict(torch.load(os.path.join(load_dir, "ema.pt"), map_location=torch.device("cpu")), strict=False)
+    print(f"Missing keys: {missing_keys}")
+    print(f"Unexpected keys: {unexpected_keys}")
     booster.load_optimizer(optimizer, os.path.join(load_dir, "optimizer"))
     if lr_scheduler is not None:
         booster.load_lr_scheduler(lr_scheduler, os.path.join(load_dir, "lr_scheduler"))
