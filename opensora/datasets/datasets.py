@@ -10,12 +10,13 @@ from torchvision.datasets.folder import IMG_EXTENSIONS, pil_loader
 from . import video_transforms
 from .utils import center_crop_arr
 
+VID_EXTENSIONS = ("mp4", "avi", "mov", "mkv")
 
 def get_transforms_video(resolution=256):
     transform_video = transforms.Compose(
         [
             video_transforms.ToTensorVideo(),  # TCHW
-            video_transforms.RandomHorizontalFlipVideo(),
+            # video_transforms.RandomHorizontalFlipVideo(),
             video_transforms.UCFCenterCropVideo(resolution),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
         ]
@@ -27,13 +28,38 @@ def get_transforms_image(image_size=256):
     transform = transforms.Compose(
         [
             transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
-            transforms.RandomHorizontalFlip(),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
         ]
     )
     return transform
 
+
+def read_image_from_path(path, transform=None, num_frames=1):
+    image = pil_loader(path)
+    if transform is None:
+        transform = get_transforms_image()
+    image = transform(image)
+    video = image.unsqueeze(0).repeat(num_frames, 1, 1, 1)
+    video = video.permute(1, 0, 2, 3)
+    return video
+
+def read_video_from_path(path, transform=None):
+    vframes, aframes, info = torchvision.io.read_video(filename=path, pts_unit="sec", output_format="TCHW")
+    if transform is None:
+        transform = get_transforms_video()
+    video = transform(vframes)  # T C H W
+    video = video.permute(1, 0, 2, 3)
+    return video
+
+def read_from_path(path):
+    ext = path.split(".")[-1]
+    if ext.lower() in VID_EXTENSIONS:
+        return read_video_from_path(path)
+    else:
+        assert f".{ext.lower()}" in IMG_EXTENSIONS, f"Unsupported file format: {ext}"
+        return read_image_from_path(path)
 
 class DatasetFromCSV(torch.utils.data.Dataset):
     """load video according to the csv file.
@@ -58,7 +84,7 @@ class DatasetFromCSV(torch.utils.data.Dataset):
             self.samples = list(reader)
 
         ext = self.samples[0][0].split(".")[-1]
-        if ext.lower() in ("mp4", "avi", "mov", "mkv"):
+        if ext.lower() in VID_EXTENSIONS:
             self.is_video = True
         else:
             assert f".{ext.lower()}" in IMG_EXTENSIONS, f"Unsupported file format: {ext}"

@@ -24,6 +24,9 @@ def parse_args(training=False):
     if not training:
         # prompt
         parser.add_argument("--prompt-path", default=None, type=str, help="path to prompt txt file")
+        parser.add_argument("--prompt", default=None, type=str, help="prompt string")
+        parser.add_argument("--reference-path", default=None, type=str, help="path to reference image")
+        parser.add_argument("--mask-strategy", default=None, type=str, help="mask strategy")
         parser.add_argument("--save-dir", default=None, type=str, help="path to save generated samples")
 
         # hyperparameters
@@ -43,15 +46,25 @@ def merge_args(cfg, args, training=False):
         args.ckpt_path = None
 
     if not training:
+        if args.reference_path is not None:
+            args.reference_path = [args.reference_path]
+        if args.mask_strategy is not None:
+            args.mask_strategy = [args.mask_strategy]
         if args.cfg_scale is not None:
             cfg.scheduler["cfg_scale"] = args.cfg_scale
             args.cfg_scale = None
+        cfg.prompt = args.prompt
 
-    if "multi_resolution" not in cfg:
-        cfg["multi_resolution"] = False
     for k, v in vars(args).items():
         if k in cfg and v is not None:
             cfg[k] = v
+
+    if "reference_path" not in cfg:
+        cfg["reference_path"] = None
+    if "loop" not in cfg:
+        cfg["loop"] = 1
+    if "multi_resolution" not in cfg:
+        cfg["multi_resolution"] = False
 
     return cfg
 

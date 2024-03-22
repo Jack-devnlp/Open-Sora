@@ -377,6 +377,7 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        mask=None,
     ):
         """
         Sample x_{t-1} from the model at the given timestep.
@@ -407,6 +408,10 @@ class GaussianDiffusion:
         if cond_fn is not None:
             out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        if mask.shape[0] != x.shape[0]:
+            mask = mask.repeat(2, 1) # HACK
+        sample = th.where(mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1), sample, x)
+
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_loop(
@@ -420,6 +425,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        mask=None,
     ):
         """
         Generate samples from the model.
@@ -450,6 +456,7 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
+            mask=mask,
         ):
             final = sample
         return final["sample"]
@@ -465,6 +472,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        mask=None,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -499,6 +507,7 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
+                    mask=mask,
                 )
                 yield out
                 img = out["sample"]
